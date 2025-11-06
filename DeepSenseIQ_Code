@@ -1,0 +1,213 @@
+import os, random, numpy as np, pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import mean_absolute_error, r2_score
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+SEED = 42
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+random.seed(SEED)
+
+from google.colab import files
+print("Please upload DeepSenseIQ_MultiDomain_Analytics.csv")
+uploaded = files.upload()   # Choose the CSV you downloaded earlier
+CSV_NAME = [k for k in uploaded.keys() if k.endswith('.csv')][0]
+print("Using:", CSV_NAME)
+
+df = pd.read_csv(CSV_NAME)
+
+# Basic checks
+display(df.head())
+print(df.shape, df.dtypes)
+
+# Optional: sanity on target
+assert 'Revenue' in df.columns and df['Revenue'].notna().all(), "Revenue target missing/NaN!"
+print("Revenue summary:\n", df['Revenue'].describe())
+
+# Correlation heatmap (numeric only)
+num_cols = df.select_dtypes(include=['int64','float64']).columns.tolist()
+plt.figure(figsize=(10,7))
+sns.heatmap(df[num_cols].corr(), annot=False, cmap='coolwarm', center=0)
+plt.title("Numeric Feature Correlations")
+plt.show()
+
+# Identify columns
+target_col = 'Revenue'
+categorical_cols = ['Product_Category','Region','Season','Day_of_Week']
+binary_cols = ['Festival_Flag']  # already 0/1
+numeric_cols = [c for c in df.columns if c not in categorical_cols + binary_cols + [target_col, 'Transaction_ID']]
+
+# X, y
+X = df[categorical_cols + binary_cols + numeric_cols]
+y = df[target_col].values.astype('float32')
+
+# ColumnTransformer: OHE for cats, pass-through binary+numeric, then scale all numeric/binary (not OHE)
+preprocess = ColumnTransformer(
+    transformers=[
+        ('cat', OneHotEncoder(sparse_output=False, handle_unknown='ignore'), categorical_cols),
+        ('pass', 'passthrough', binary_cols + numeric_cols)
+    ],
+    remainder='drop'
+)
+
+# We'll scale only the passthrough numeric/binary block using a Pipeline
+# Trick: fit preprocess to get shapes, then wrap scaler after transform via a small helper pipeline
+
+X_train_raw, X_temp_raw, y_train, y_temp = train_test_split(X, y, test_size=0.3, random_state=SEED)
+X_val_raw, X_test_raw, y_val, y_test = train_test_split(X_temp_raw, y_temp, test_size=0.5, random_state=SEED)
+
+# Fit transform on train; transform val/test
+X_train_ohe = preprocess.fit_transform(X_train_raw)
+X_val_ohe   = preprocess.transform(X_val_raw)
+X_test_ohe  = preprocess.transform(X_test_raw)
+
+# Derive which columns were OHE vs passthrough
+ohe_dim = preprocess.named_transformers_['cat'].get_feature_names_out(categorical_cols).shape[0]
+pass_dim = X_train_ohe.shape[1] - ohe_dim
+
+# Scale only the last pass_dim columns
+scaler = StandardScaler()
+X_train = np.hstack([
+    X_train_ohe[:, :ohe_dim],
+    scaler.fit_transform(X_train_ohe[:, ohe_dim:])
+]).astype('float32')
+
+X_val = np.hstack([
+    X_val_ohe[:, :ohe_dim],
+    scaler.transform(X_val_ohe[:, ohe_dim:])
+]).astype('float32')
+
+X_test = np.hstack([
+    X_test_ohe[:, :ohe_dim],
+    scaler.transform(X_test_ohe[:, ohe_dim:])
+]).astype('float32')
+
+input_dim = X_train.shape[1]
+print("Input dim after encoding:", input_dim)
+
+def build_autoencoder(input_dim, latent_dim=32):
+    inp = layers.Input(shape=(input_dim,))
+    x = layers.Dense(256, activation='relu')(inp)
+    x = layers.Dense(128, activation='relu')(x)
+    x = layers.Dense(64, activation='relu')(x)
+    latent = layers.Dense(latent_dim, activation='linear', name='latent')(x)
+
+    x = layers.Dense(64, activation='relu')(latent)
+    x = layers.Dense(128, activation='relu')(x)
+    x = layers.Dense(256, activation='relu')(x)
+    out = layers.Dense(input_dim, activation='linear')(x)
+
+    ae = keras.Model(inp, out, name='autoencoder')
+    enc = keras.Model(inp, latent, name='encoder')
+    ae.compile(optimizer=keras.optimizers.Adam(1e-3), loss='mse')
+    return ae, enc
+
+ae, encoder = build_autoencoder(input_dim, latent_dim=32)
+es = keras.callbacks.EarlyStopping(monitor='val_loss', patience=8, restore_best_weights=True)
+hist = ae.fit(
+    X_train, X_train,
+    validation_data=(X_val, X_val),
+    epochs=100, batch_size=256, callbacks=[es], verbose=1
+)
+
+print("AE val loss:", min(hist.history['val_loss']))
+Z_train = encoder.predict(X_train, batch_size=1024)
+Z_val   = encoder.predict(X_val,   batch_size=1024)
+Z_test  = encoder.predict(X_test,  batch_size=1024)
+print("Latent shape:", Z_train.shape)
+
+
+def build_insightnet(input_dim, heads=4, proj_dim=16, hidden=128, dropout=0.1):
+    inp = layers.Input(shape=(input_dim,), name='X_in')
+    # reshape to (batch, seq_len=features, dim=1)
+    x = layers.Reshape((input_dim, 1))(inp)
+    # project to higher dim for attention
+    x = layers.Dense(proj_dim)(x)
+    # self-attention
+    attn_out = layers.MultiHeadAttention(num_heads=heads, key_dim=proj_dim, output_shape=proj_dim, name='self_attn')(x, x)
+    x = layers.Add()([x, attn_out])
+    x = layers.LayerNormalization()(x)
+    x = layers.GlobalAveragePooling1D()(x)  # pool across features
+    x = layers.Dense(hidden, activation='relu')(x)
+    x = layers.Dropout(dropout)(x)
+    out = layers.Dense(1, activation='linear', name='y')(x)
+    model = keras.Model(inp, out, name='InsightNet')
+    model.compile(optimizer=keras.optimizers.Adam(1e-3), loss='mae', metrics=['mse'])
+    return model
+
+insightnet = build_insightnet(input_dim)
+es2 = keras.callbacks.EarlyStopping(monitor='val_loss', patience=8, restore_best_weights=True)
+hist2 = insightnet.fit(
+    X_train, y_train,
+    validation_data=(X_val, y_val),
+    epochs=100, batch_size=256, callbacks=[es2], verbose=1
+)
+
+pred = insightnet.predict(X_test, batch_size=1024).ravel()
+print("Test MAE:", mean_absolute_error(y_test, pred))
+print("Test R2 :", r2_score(y_test, pred))
+
+
+# Gradient-based saliency for feature importances
+@tf.function
+def input_gradients(model, x_batch):
+    x = tf.convert_to_tensor(x_batch)
+    with tf.GradientTape() as tape:
+        tape.watch(x)
+        y_pred = model(x, training=False)
+        loss = tf.reduce_mean(y_pred)
+    grads = tape.gradient(loss, x)
+    return grads
+
+# Compute mean absolute gradient across a sample of test points
+sample = X_test[:2048] if X_test.shape[0] > 2048 else X_test
+grads = input_gradients(insightnet, sample).numpy()
+feat_importance = np.mean(np.abs(grads), axis=0)  # shape: (input_dim,)
+
+# Map back to feature names
+ohe_names = preprocess.named_transformers_['cat'].get_feature_names_out(categorical_cols).tolist()
+pass_names = binary_cols + numeric_cols
+feature_names = ohe_names + pass_names
+
+imp_df = pd.DataFrame({'feature': feature_names, 'importance': feat_importance})
+imp_df = imp_df.sort_values('importance', ascending=False).reset_index(drop=True)
+display(imp_df.head(20))
+
+plt.figure(figsize=(10,6))
+sns.barplot(data=imp_df.head(20), x='importance', y='feature')
+plt.title('Top-20 Feature Importances (Gradient Saliency)')
+plt.tight_layout()
+plt.show()
+
+from sklearn.decomposition import PCA
+
+pca = PCA(n_components=2, random_state=SEED)
+Z2 = pca.fit_transform(Z_test)
+plt.figure(figsize=(6,5))
+plt.scatter(Z2[:,0], Z2[:,1], c=y_test, s=10, cmap='viridis')
+plt.colorbar(label='Revenue')
+plt.title('Latent Space (Autoencoder) colored by Revenue')
+plt.tight_layout()
+plt.show()
+
+print("=== DeepSenseIQ: Neural Insights ===")
+print(f"Test MAE: {mean_absolute_error(y_test, pred):.4f}")
+print(f"Test R2 : {r2_score(y_test, pred):.4f}\n")
+
+print("Top 10 drivers of Revenue (by model saliency):")
+for i, row in imp_df.head(10).iterrows():
+    print(f"{i+1:>2}. {row['feature']}  --> importance={row['importance']:.6f}")
+
+print("\nInterpretation notes:")
+print("- High saliency features indicate stronger marginal influence on predicted Revenue.")
+print("- OHE features like Product_Category_* or Season_* reveal category-specific effects.")
+print("- Numeric drivers (e.g., Ad_Spend, Customer_Footfall, Discount_Rate) typically dominate,")
+print("  but interactions with season/day/competition are captured via attention and gradients.")
+
